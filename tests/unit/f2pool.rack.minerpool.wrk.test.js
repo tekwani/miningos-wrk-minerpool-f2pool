@@ -756,3 +756,95 @@ test('WrkMinerPoolRackF2Pool: fetchData should handle errors gracefully', async 
   t.ok(worker._errors)
   t.is(worker._errors[0].msg, 'ERR_DATA_FETCH')
 })
+
+function createFakeBee () {
+  const m = new Map()
+  return {
+    async get (key) {
+      const v = m.get(Buffer.from(key).toString('hex'))
+      return v ? { value: v } : null
+    },
+    async put (key, val) {
+      m.set(Buffer.from(key).toString('hex'), val)
+    },
+    createReadStream ({ gte, lte } = {}) {
+      const items = [...m.entries()]
+        .map(([h, v]) => ({ k: Buffer.from(h, 'hex'), value: v }))
+        .filter(({ k }) => (!gte || Buffer.compare(k, gte) >= 0) && (!lte || Buffer.compare(k, lte) <= 0))
+        .sort((a, b) => Buffer.compare(a.k, b.k))
+      return (async function * () {
+        for (const it of items) yield { value: it.value }
+      })()
+    }
+  }
+}
+
+test('WrkMinerPoolRackF2Pool: getF2poolStatus returns online when API responds', async (t) => {
+  const worker = createMockWorker()
+  t.is(await worker.getF2poolStatus(), 'online')
+})
+
+test('WrkMinerPoolRackF2Pool: getF2poolStatus returns offline when API throws', async (t) => {
+  const worker = createMockWorker()
+  worker.f2poolApi.getHashRateInfo = async () => { throw new Error('unreachable') }
+  t.is(await worker.getF2poolStatus(), 'offline')
+})
+
+test('WrkMinerPoolRackF2Pool: getF2poolStatus returns null when no accounts', async (t) => {
+  const worker = createMockWorker(
+    { f2pool: { accounts: [], apiSecret: 's', apiUrl: 'http://x' } },
+    { rack: 'rack-1' }
+  )
+  t.is(await worker.getF2poolStatus(), null)
+})
+
+test('WrkMinerPoolRackF2Pool: getComponentStatus reports f2pool status', async (t) => {
+  const worker = createMockWorker()
+  t.alike(await worker.getComponentStatus(), { f2pool: 'online' })
+})
+
+test('WrkMinerPoolRackF2Pool: evaluateAlerts raises and exposes F2pool_Offline', async (t) => {
+  const worker = createMockWorker()
+  worker.data.alertsData = { ts: 0, alerts: [] }
+  worker.data.alertsPrev = {}
+  worker.alertsHistoryDb = createFakeBee()
+  worker.f2poolApi.getHashRateInfo = async () => { throw new Error('down') }
+
+  const active = await worker.evaluateAlerts(1000)
+  t.is(active.length, 1)
+  t.is(active[0].name, 'F2pool_Offline')
+
+  const current = await worker.getWrkExtData({ query: { key: 'alerts' } })
+  t.is(current.alerts.length, 1)
+  t.is(current.alerts[0].name, 'F2pool_Offline')
+
+  const history = await worker.getWrkExtData({ query: { key: 'alerts-history', start: 1, end: 5000 } })
+  t.is(history.length, 1)
+  t.is(history[0].alerts[0].name, 'F2pool_Offline')
+})
+
+test('WrkMinerPoolRackF2Pool: evaluateAlerts keeps stable identity and one history bucket', async (t) => {
+  const worker = createMockWorker()
+  worker.data.alertsData = { ts: 0, alerts: [] }
+  worker.data.alertsPrev = {}
+  worker.alertsHistoryDb = createFakeBee()
+  worker.f2poolApi.getHashRateInfo = async () => { throw new Error('down') }
+
+  const first = (await worker.evaluateAlerts(1000))[0]
+  const second = (await worker.evaluateAlerts(2000))[0]
+  t.is(second.createdAt, first.createdAt, 'createdAt stays stable')
+  t.is(second.uuid, first.uuid, 'uuid stays stable')
+
+  const history = await worker.getWrkExtData({ query: { key: 'alerts-history', start: 1, end: 5000 } })
+  t.is(history.length, 1, 'no duplicate history bucket')
+})
+
+test('WrkMinerPoolRackF2Pool: evaluateAlerts raises nothing when reachable', async (t) => {
+  const worker = createMockWorker()
+  worker.data.alertsData = { ts: 0, alerts: [] }
+  worker.data.alertsPrev = {}
+  worker.alertsHistoryDb = createFakeBee()
+
+  const active = await worker.evaluateAlerts(1000)
+  t.is(active.length, 0)
+})

@@ -6,6 +6,7 @@ const async = require('async')
 const TetherWrkBase = require('@tetherto/tether-wrk-base/workers/base.wrk.tether')
 const { getWorkersStats, getTimeRanges, isCurrentMonth, getMonthlyDateRanges } = require('./lib/utils')
 const { BTC_SATS, SCHEDULER_TIMES } = require('./lib/constants')
+const { buildAlerts } = require('./lib/alerts')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
 const mingo = require('mingo')
@@ -26,7 +27,9 @@ class WrkMinerPoolRackF2Pool extends TetherWrkBase {
       statsData: {},
       workersData: { ts: 0, workers: [] },
       blocks: [],
-      yearlyBalances: {}
+      yearlyBalances: {},
+      alertsData: { ts: 0, alerts: [] },
+      alertsPrev: {}
     }
   }
 
@@ -67,6 +70,7 @@ class WrkMinerPoolRackF2Pool extends TetherWrkBase {
         this.workersCountDb = db.sub('workers-count')
         this.statsDb = db.sub('stats')
         this.workersDb = db.sub('workers')
+        this.alertsHistoryDb = db.sub('alerts-history')
 
         this.f2poolApi = new F2PoolMinerPool(this.http_0, this.apiSecret)
 
@@ -84,6 +88,7 @@ class WrkMinerPoolRackF2Pool extends TetherWrkBase {
       switch (key) {
         case SCHEDULER_TIMES._1M.key:
           await this.fetchStats(time)
+          await this.evaluateAlerts(time.getTime())
           break
         case SCHEDULER_TIMES._5M.key:
           await this.fetchWorkers(time)
@@ -352,6 +357,55 @@ class WrkMinerPoolRackF2Pool extends TetherWrkBase {
     }
   }
 
+  async getF2poolStatus () {
+    const username = this.accounts?.[0]
+    if (!username) return null
+    try {
+      await this.f2poolApi.getHashRateInfo(username)
+      return 'online'
+    } catch (e) {
+      this._logErr('ERR_F2POOL_REACHABILITY', e)
+      return 'offline'
+    }
+  }
+
+  async getComponentStatus () {
+    return { f2pool: await this.getF2poolStatus() }
+  }
+
+  // Bucket shape `{ ts, alerts: [...] }` is required by the ork's arr_concat aggregation.
+  async _appendAlertHistory (alert) {
+    const key = utilsStore.convIntToBin(alert.createdAt)
+    let entry = { ts: alert.createdAt, alerts: [] }
+    const existing = await this.alertsHistoryDb.get(key)
+    if (existing) entry = JSON.parse(existing.value.toString())
+    if (!entry.alerts.some(a => a.uuid === alert.uuid)) {
+      entry.alerts.push(alert)
+      await this.alertsHistoryDb.put(key, Buffer.from(JSON.stringify(entry)))
+    }
+  }
+
+  async evaluateAlerts (now = Date.now()) {
+    const status = await this.getComponentStatus()
+    this.data.alertStatus = status
+
+    const prev = this.data.alertsPrev || {}
+    const active = buildAlerts(status, prev, now)
+
+    for (const alert of active) {
+      if (!prev[alert.name]) {
+        await this._appendAlertHistory(alert)
+      }
+    }
+
+    const activeByName = {}
+    for (const alert of active) activeByName[alert.name] = alert
+    this.data.alertsPrev = activeByName
+    this.data.alertsData = { ts: now, alerts: active }
+
+    return active
+  }
+
   async getWrkExtData (req) {
     const { query } = req
     if (!query) throw new Error('ERR_QUERY_INVALID')
@@ -383,6 +437,12 @@ class WrkMinerPoolRackF2Pool extends TetherWrkBase {
         data = await this.getDbData(this.statsDb, query)
         if (query.interval) data = this._aggrByInterval(data, query.interval)
         data.forEach(d => { if (d.stats) d.stats = this.appendPoolType(d.stats) })
+        break
+      case 'alerts':
+        data = this.data.alertsData
+        break
+      case 'alerts-history':
+        data = await this.getDbData(this.alertsHistoryDb, query)
         break
       default:
         data = this.data[key]
